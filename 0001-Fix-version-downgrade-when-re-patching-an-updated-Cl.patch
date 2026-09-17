@@ -1,0 +1,374 @@
+From 04c2052cf96e9b5f081f7359dc99486cd241530f Mon Sep 17 00:00:00 2001
+From: zhouzhou <java_ht@163.com>
+Date: Sat, 12 Sep 2026 22:17:50 +0800
+Subject: [PATCH] Fix version downgrade when re-patching an updated Claude.app
+ (issue #156)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The pre-install cleanup (--restore-if-backup-exists) restored the OLDEST
+Claude.backup-before-zh-CN-*.app unconditionally and deleted the currently
+installed app. After an official auto-update, re-running the installer
+therefore downgraded Claude to whatever version the stale backup held and
+removed the freshly updated build (reported as "客户端变回1.2的版本").
+
+Now the decision is signature- and version-aware:
+
+- If the installed app is still officially signed (Developer ID), it is
+  an unpatched build; skip the restore entirely and patch it in place.
+  Ad-hoc signature is the patcher's own marker, so a lingering backup in
+  this state is always stale.
+- When a restore is needed (patched/Frida-signed app or missing app),
+  restore the backup with the highest CFBundleShortVersionString instead
+  of the oldest timestamp, so falling back can never downgrade Claude.
+- --restore (uninstall) also picks the highest-version backup.
+- After a successful install, prune stale backups, keeping only the new
+  pre-patch snapshot; at most one backup now lingers in /Applications.
+- The official-skip branch no longer quits Claude needlessly.
+
+Windows install_windows.ps1 keeps per-file backup sets and is unaffected.
+---
+ install-mac.command                |   2 +-
+ scripts/patch_claude_zh_cn.py      | 104 +++++++++++++++++++--
+ tests/test_backup_restore_logic.py | 142 +++++++++++++++++++++++++++++
+ 3 files changed, 237 insertions(+), 11 deletions(-)
+ create mode 100644 tests/test_backup_restore_logic.py
+
+diff --git a/install-mac.command b/install-mac.command
+index 46d4174..cca87f0 100755
+--- a/install-mac.command
++++ b/install-mac.command
+@@ -140,7 +140,7 @@ for arg in "$@"; do
+ done
+ 
+ if [ "$ACTION" = "install" ]; then
+-  echo "安装前清理旧中文补丁..."
++  echo "安装前检查旧中文补丁..."
+   if [ "$(id -u)" -ne 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+     sudo "$PYTHON" "$PATCHER" --user-home "$HOME" --restore-if-backup-exists "$@"
+   else
+diff --git a/scripts/patch_claude_zh_cn.py b/scripts/patch_claude_zh_cn.py
+index 4f6708f..5b84a34 100755
+--- a/scripts/patch_claude_zh_cn.py
++++ b/scripts/patch_claude_zh_cn.py
+@@ -2773,20 +2773,94 @@ def find_app_backups(app: Path) -> list[Path]:
+     return sorted(path for path in app.parent.glob(BACKUP_GLOB) if path.is_dir())
+ 
+ 
+-def restore_oldest_backup(app: Path, dry_run: bool) -> Path:
++def bundle_version(app: Path) -> str:
++    """Return the app bundle version, or "0" when it cannot be read."""
++    info_plist = app / "Contents/Info.plist"
++    try:
++        with info_plist.open("rb") as f:
++            info = plistlib.load(f)
++    except Exception:
++        return "0"
++    for key in ("CFBundleShortVersionString", "CFBundleVersion"):
++        value = info.get(key)
++        if isinstance(value, str) and value.strip():
++            return value.strip()
++    return "0"
++
++
++def version_key(value: str) -> tuple[int, ...]:
++    """Numeric sort key for versions like "1.2" or "1.46388.3"."""
++    parts = [int(part) for part in re.findall(r"\d+", value)]
++    return tuple(parts + [0] * (3 - len(parts)))
++
++
++def _official_signature(info: dict[str, Any]) -> bool:
++    """Classify a codesign_info() result as an unpatched official build."""
++    if info.get("adhoc"):
++        return False
++    return "Authority=Developer ID Application" in info.get("raw", "")
++
++
++def is_officially_signed(app: Path) -> bool:
++    """True when *app* still carries its official Developer ID signature.
++
++    The patcher always re-signs with an ad-hoc signature, so a non-official
++    signature means the on-disk app was patched (or Frida-prepared) by this
++    toolchain and only a backup restore brings back clean official resources.
++    Anything unreadable counts as non-official to stay conservative.
++    """
++    try:
++        return _official_signature(codesign_info(app))
++    except Exception:
++        return False
++
++
++def preinstall_should_restore(app: Path) -> bool:
++    """True when the installed app needs a backup restore before re-patching.
++
++    Auto-update replaces the patched app with an official build, so an
++    officially signed install is never restored: restoring would downgrade
++    Claude to a stale backup and delete the fresh version (issue #156).
++    """
++    return not (app.exists() and is_officially_signed(app))
++
++
++def select_backup(backups: list[Path]) -> Path:
++    """Pick the backup with the highest bundled version (name as tie-breaker).
++
++    Restoring the oldest backup could downgrade Claude below the currently
++    installed version; the highest-version backup is the safest official
++    snapshot to fall back to.
++    """
++    return max(backups, key=lambda path: (version_key(bundle_version(path)), path.name))
++
++
++def prune_stale_backups(app: Path, keep: Path, dry_run: bool) -> None:
++    """Delete all zh-CN app backups except *keep*."""
++    for path in find_app_backups(app):
++        if path == keep:
++            continue
++        if dry_run:
++            print(f"[dry-run] Would delete stale backup: {path}")
++            continue
++        print(f"Deleting stale backup: {path}")
++        remove_path(path)
++
++
++def restore_backup(app: Path, dry_run: bool) -> Path:
+     backups = find_app_backups(app)
+     if not backups:
+         raise SystemExit(f"No Claude backup found in {app.parent}: {BACKUP_GLOB}")
+ 
+-    backup = backups[0]
+-    extra_backups = backups[1:]
++    backup = select_backup(backups)
++    extra_backups = [path for path in backups if path != backup]
+     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+     current_tmp = app.with_name(f"Claude.restore-current-{stamp}.app")
+ 
+     if dry_run:
+         if app.exists():
+             print(f"[dry-run] Would move current app {app} -> {current_tmp}")
+-        print(f"[dry-run] Would restore oldest backup {backup} -> {app}")
++        print(f"[dry-run] Would restore backup {backup} -> {app}")
+         for extra_backup in extra_backups:
+             print(f"[dry-run] Would delete extra backup: {extra_backup}")
+         return backup
+@@ -2796,7 +2870,7 @@ def restore_oldest_backup(app: Path, dry_run: bool) -> Path:
+         shutil.move(str(app), str(current_tmp))
+ 
+     try:
+-        print(f"Restoring oldest backup: {backup}")
++        print(f"Restoring backup: {backup}")
+         shutil.move(str(backup), str(app))
+     except Exception:
+         if current_tmp.exists() and not app.exists():
+@@ -2912,11 +2986,11 @@ def main() -> int:
+     parser.add_argument("--lang", choices=["zh-CN", "zh-TW", "zh-HK"], default="zh-CN", help="Language code to install (default: zh-CN)")
+     parser.add_argument("--dry-run", action="store_true", help="Prepare and verify a patched temp app, but do not replace /Applications/Claude.app")
+     parser.add_argument("--launch", action="store_true", help="Launch Claude after installation")
+-    parser.add_argument("--restore", action="store_true", help="Restore the oldest macOS app backup and delete other backups")
++    parser.add_argument("--restore", action="store_true", help="Restore the latest macOS app backup and delete other backups")
+     parser.add_argument(
+         "--restore-if-backup-exists",
+         action="store_true",
+-        help="Restore the oldest macOS app backup if one exists, otherwise continue without error",
++        help="Before install, restore the latest app backup when the installed app is patched; skip when it is an official build",
+     )
+     parser.add_argument("--skip-asar-patch", action="store_true", help="Skip app.asar and binary integrity patches (safe mode)")
+     parser.add_argument(
+@@ -2977,7 +3051,7 @@ def main() -> int:
+             print("[dry-run] Claude will not be quit.")
+         else:
+             quit_claude()
+-        restored = restore_oldest_backup(args.app, args.dry_run)
++        restored = restore_backup(args.app, args.dry_run)
+         if args.dry_run:
+             print(f"[dry-run] Would set Claude config locale under: {args.user_home} to en-US")
+         else:
+@@ -2985,18 +3059,27 @@ def main() -> int:
+             print(f"Restored from backup: {restored}")
+             if args.launch:
+                 run(["open", "-a", str(args.app)], check=False)
+-        print("Done. Claude Desktop has been restored to the oldest backup.")
++        print("Done. Claude Desktop has been restored from the latest backup.")
+         return 0
+ 
+     if args.restore_if_backup_exists:
+         if not find_app_backups(args.app):
+             print(f"No Claude backup found in {args.app.parent}: {BACKUP_GLOB}; skipping pre-install restore.")
+             return 0
++        if not preinstall_should_restore(args.app):
++            # Auto-update replaces the patched app with an official build, so a
++            # lingering backup is stale here. Restoring it would downgrade Claude
++            # and delete the fresh version (issue #156); patch this app directly.
++            print(
++                f"Officially signed app detected: {args.app} "
++                f"(version {bundle_version(args.app)}); skipping pre-install restore."
++            )
++            return 0
+         if args.dry_run:
+             print("[dry-run] Claude will not be quit.")
+         else:
+             quit_claude()
+-        restored = restore_oldest_backup(args.app, args.dry_run)
++        restored = restore_backup(args.app, args.dry_run)
+         if not args.dry_run:
+             print(f"Restored from backup before install: {restored}")
+         print("Done. Existing Chinese patch has been cleared before install.")
+@@ -3054,6 +3137,7 @@ def main() -> int:
+     backup = backup_and_replace(args.app, patched_app, args.dry_run)
+     if not args.dry_run:
+         print(f"Backup kept at: {backup}")
++        prune_stale_backups(args.app, keep=backup, dry_run=False)
+         if args.launch:
+             run(["open", "-a", str(args.app)], check=False)
+ 
+diff --git a/tests/test_backup_restore_logic.py b/tests/test_backup_restore_logic.py
+new file mode 100644
+index 0000000..9916a32
+--- /dev/null
++++ b/tests/test_backup_restore_logic.py
+@@ -0,0 +1,142 @@
++"""Unit tests for the pre-install backup/restore downgrade fix (issue #156).
++
++The macOS installer restores `Claude.backup-before-zh-CN-*.app` backups
++before re-patching. It used to restore the OLDEST backup unconditionally,
++which downgraded Claude to a stale version and deleted a freshly updated
++official app. These tests cover the version-aware helpers that replaced it:
++
++* version_key / bundle_version: numeric version comparison;
++* select_backup: always picks the highest-version backup;
++* _official_signature: Developer ID = official, ad-hoc = patched;
++* preinstall_should_restore: official builds are never restored.
++"""
++
++import importlib.util
++import plistlib
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from unittest.mock import patch
++
++ROOT = Path(__file__).resolve().parents[1]
++PYTHON_PATCHER = ROOT / "scripts" / "patch_claude_zh_cn.py"
++
++
++def load_python_patcher():
++    spec = importlib.util.spec_from_file_location("claude_zh_patcher", PYTHON_PATCHER)
++    if spec is None or spec.loader is None:
++        raise RuntimeError(f"Unable to import {PYTHON_PATCHER}")
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++patcher = load_python_patcher()
++
++
++def make_bundle(root: Path, name: str, version: str) -> Path:
++    app = root / name
++    contents = app / "Contents"
++    contents.mkdir(parents=True)
++    info = {
++        "CFBundleIdentifier": "com.anthropic.claudefordesktop",
++        "CFBundleShortVersionString": version,
++    }
++    (contents / "Info.plist").write_bytes(plistlib.dumps(info))
++    return app
++
++
++class VersionKeyTests(unittest.TestCase):
++    def test_issue_156_regression_pair(self):
++        # The reporter's stale backup (1.2) vs the freshly downloaded app.
++        self.assertLess(patcher.version_key("1.2"), patcher.version_key("1.46388.3"))
++
++    def test_numeric_segments_compare_numerically(self):
++        self.assertLess(patcher.version_key("0.9.9"), patcher.version_key("0.9.10"))
++
++    def test_unreadable_version_sorts_lowest(self):
++        self.assertEqual(patcher.version_key("not-a-version"), (0, 0, 0))
++        self.assertLess(patcher.version_key("not-a-version"), patcher.version_key("0.0.1"))
++
++
++class BundleVersionTests(unittest.TestCase):
++    def test_reads_short_version_string(self):
++        with TemporaryDirectory() as tmp:
++            app = make_bundle(Path(tmp), "Claude.app", "1.46388.3")
++            self.assertEqual(patcher.bundle_version(app), "1.46388.3")
++
++    def test_falls_back_to_cf_bundle_version(self):
++        with TemporaryDirectory() as tmp:
++            app = Path(tmp) / "Claude.app"
++            (app / "Contents").mkdir(parents=True)
++            (app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleVersion": "77"}))
++            self.assertEqual(patcher.bundle_version(app), "77")
++
++    def test_missing_plist_returns_zero(self):
++        self.assertEqual(patcher.bundle_version(Path("/nonexistent/Claude.app")), "0")
++
++
++class SelectBackupTests(unittest.TestCase):
++    def test_picks_highest_version_not_oldest_name(self):
++        # The highest version (1.46388.3) carries the OLDEST timestamp, so
++        # neither name order nor timestamp order alone may decide the pick.
++        with TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            backups = [
++                make_bundle(root, "Claude.backup-before-zh-CN-20260801-000000.app", "1.46388.3"),
++                make_bundle(root, "Claude.backup-before-zh-CN-20260810-000000.app", "1.2"),
++                make_bundle(root, "Claude.backup-before-zh-CN-20260901-000000.app", "1.3"),
++            ]
++            self.assertEqual(patcher.select_backup(backups), backups[0])
++
++    def test_tie_breaks_on_name(self):
++        with TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            backups = [
++                make_bundle(root, "Claude.backup-before-zh-CN-20260801-000000.app", "1.2"),
++                make_bundle(root, "Claude.backup-before-zh-CN-20260901-000000.app", "1.2"),
++            ]
++            self.assertEqual(patcher.select_backup(backups), backups[1])
++
++
++class OfficialSignatureTests(unittest.TestCase):
++    def test_developer_id_is_official(self):
++        info = {
++            "adhoc": False,
++            "raw": (
++                "Authority=Developer ID Application: Anthropic, PBC (TEAMID)\n"
++                "TeamIdentifier=TEAMID"
++            ),
++        }
++        self.assertTrue(patcher._official_signature(info))
++
++    def test_adhoc_is_not_official(self):
++        info = {"adhoc": True, "raw": "Authority=(unavailable)\nSignature=adhoc"}
++        self.assertFalse(patcher._official_signature(info))
++
++    def test_unreadable_codesign_is_not_official(self):
++        with patch.object(patcher, "codesign_info", side_effect=RuntimeError("boom")):
++            self.assertFalse(patcher.is_officially_signed(Path("/nonexistent")))
++
++
++class PreinstallShouldRestoreTests(unittest.TestCase):
++    def test_official_build_is_never_restored(self):
++        with TemporaryDirectory() as tmp:
++            app = make_bundle(Path(tmp), "Claude.app", "1.46388.3")
++            with patch.object(patcher, "is_officially_signed", return_value=True):
++                self.assertFalse(patcher.preinstall_should_restore(app))
++
++    def test_patched_build_is_restored(self):
++        with TemporaryDirectory() as tmp:
++            app = make_bundle(Path(tmp), "Claude.app", "1.46388.3")
++            with patch.object(patcher, "is_officially_signed", return_value=False):
++                self.assertTrue(patcher.preinstall_should_restore(app))
++
++    def test_missing_app_is_restored(self):
++        # No installed app while backups exist: the backup is the only source.
++        with patch.object(patcher, "is_officially_signed", return_value=True):
++            self.assertTrue(patcher.preinstall_should_restore(Path("/nonexistent/Claude.app")))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.55.0
+
