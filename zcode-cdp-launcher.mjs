@@ -18,8 +18,56 @@ import path from "node:path";
 import os from "node:os";
 import { spawn, execSync } from "node:child_process";
 
-const APP_PATH = "/Applications/ZCode.app";
-const ASAR_PATH = path.join(APP_PATH, "Contents/Resources/app.asar");
+const isWin = process.platform === "win32";
+
+// 跨平台解析 ZCode 可执行文件与 app.asar 路径
+function resolveAppPaths() {
+  const customPath = process.env.ZCODE_PATH;
+  if (customPath && fs.existsSync(customPath)) {
+    const isDir = fs.statSync(customPath).isDirectory();
+    if (isWin) {
+      const exe = isDir ? path.join(customPath, "ZCode.exe") : customPath;
+      const asar = path.join(path.dirname(exe), "resources", "app.asar");
+      return { exe, asar };
+    } else {
+      const exe = customPath;
+      const asar = path.join(customPath, "Contents", "Resources", "app.asar");
+      return { exe, asar };
+    }
+  }
+
+  if (isWin) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+    const programFilesX86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+
+    const candidates = [
+      path.join(localAppData, "Programs", "ZCode", "ZCode.exe"),
+      path.join(localAppData, "ZCode", "ZCode.exe"),
+      path.join(programFiles, "ZCode", "ZCode.exe"),
+      path.join(programFilesX86, "ZCode", "ZCode.exe")
+    ];
+
+    for (const exe of candidates) {
+      if (fs.existsSync(exe)) {
+        const asar = path.join(path.dirname(exe), "resources", "app.asar");
+        if (fs.existsSync(asar)) {
+          return { exe, asar };
+        }
+      }
+    }
+
+    const fallbackExe = candidates[0];
+    return { exe: fallbackExe, asar: path.join(path.dirname(fallbackExe), "resources", "app.asar") };
+  } else {
+    const defaultApp = "/Applications/ZCode.app";
+    return {
+      exe: defaultApp,
+      asar: path.join(defaultApp, "Contents", "Resources", "app.asar")
+    };
+  }
+}
+
 const DEFAULT_PORT = 9333; // 专用调试端口，避开 9222 (Brave/Chrome 等浏览器默认占用)
 
 // 1. 解析命令行参数
@@ -57,8 +105,13 @@ async function checkPortOpen(port) {
 
 function isZCodeProcessRunning() {
   try {
-    const stdout = execSync('pgrep -f "/Applications/ZCode.app/Contents/MacOS/ZCode" || pgrep -f "ZCode Helper" || true', { encoding: "utf8" });
-    return stdout.trim().split("\n").filter(Boolean).length > 0;
+    if (isWin) {
+      const stdout = execSync('tasklist /FI "IMAGENAME eq ZCode.exe" /NH', { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      return stdout.toLowerCase().includes("zcode.exe");
+    } else {
+      const stdout = execSync('pgrep -f "/Applications/ZCode.app/Contents/MacOS/ZCode" || pgrep -f "ZCode Helper" || true', { encoding: "utf8" });
+      return stdout.trim().split("\n").filter(Boolean).length > 0;
+    }
   } catch {
     return false;
   }
@@ -66,22 +119,29 @@ function isZCodeProcessRunning() {
 
 function quitZCode() {
   try {
-    execSync('osascript -e \'tell application "ZCode" to quit\' 2>/dev/null || true');
-  } catch {}
-  for (let i = 0; i < 6; i++) {
-    if (!isZCodeProcessRunning()) return true;
-    execSync("sleep 0.5");
-  }
-  try {
-    execSync('pkill -f "/Applications/ZCode.app" 2>/dev/null || true');
+    if (isWin) {
+      execSync('taskkill /IM ZCode.exe /F 2>nul || exit 0', { shell: "cmd.exe", stdio: "ignore" });
+    } else {
+      try {
+        execSync('osascript -e \'tell application "ZCode" to quit\' 2>/dev/null || true');
+      } catch {}
+      for (let i = 0; i < 6; i++) {
+        if (!isZCodeProcessRunning()) return true;
+        execSync("sleep 0.5");
+      }
+      try {
+        execSync('pkill -f "/Applications/ZCode.app" 2>/dev/null || true');
+      } catch {}
+    }
   } catch {}
   return true;
 }
 
 // 3. 从 app.asar 纯内存提取指定文件（完全不修改原 asar 文件）
 function readAsarEntry(pattern) {
+  const { asar: ASAR_PATH } = resolveAppPaths();
   if (!fs.existsSync(ASAR_PATH)) {
-    throw new Error(`找不到 ZCode app.asar 文件: ${ASAR_PATH}`);
+    throw new Error(`找不到 ZCode app.asar 文件: ${ASAR_PATH}\n(若安装在自定义路径，可通过环境变量 ZCODE_PATH 指定 ZCode.exe 或安装根目录)`);
   }
   const fd = fs.openSync(ASAR_PATH, "r");
   try {
@@ -504,7 +564,7 @@ async function injectViaCdp(port, patches) {
 
   console.log("\n========================================================");
   console.log("🎉 ZCode 多模态与免登录增强已通过 CDP 内存注入完全生效！");
-  console.log("   - /Applications/ZCode.app 100% 原始未动，签名安全完好");
+  console.log("   - 官方应用安装文件 100% 原始未动，签名安全完好");
   console.log("   - 启动登录/欢迎弹窗已彻底屏蔽");
   console.log("   - 左下角用户头像与名字已隐藏（仅保留设置齿轮）");
   console.log("   - /plan 快捷指令已放行图片与多模态输入");
@@ -565,11 +625,19 @@ async function main() {
       }
     }
 
+    const appPaths = resolveAppPaths();
     console.log(`  [*] 正在启动 ZCode 并附加调试端口 (--remote-debugging-port=${port})...`);
-    spawn("open", ["-a", APP_PATH, "--args", `--remote-debugging-port=${port}`], {
-      detached: true,
-      stdio: "ignore"
-    }).unref();
+    if (isWin) {
+      spawn(appPaths.exe, [`--remote-debugging-port=${port}`], {
+        detached: true,
+        stdio: "ignore"
+      }).unref();
+    } else {
+      spawn("open", ["-a", appPaths.exe, "--args", `--remote-debugging-port=${port}`], {
+        detached: true,
+        stdio: "ignore"
+      }).unref();
+    }
   }
 
   // 4. 执行注入

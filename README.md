@@ -1,8 +1,8 @@
 # ZImprove (ZCode 零侵入内存增强启动器)
 
-一套专为 **ZCode** macOS 客户端打造的零侵入、免改包、安全可靠的内存热补丁启动工具集与修复脚本。
+一套专为 **ZCode** 客户端（支持 **macOS** 与 **Windows** 双平台）打造的零侵入、免改包、安全可靠的内存热补丁启动工具集与修复脚本。
 
-利用 Chrome DevTools Protocol (CDP) 在应用启动时进行纯内存级别的资源拦截与注入，**无需解包或修改 `/Applications/ZCode.app` 安装文件，不破坏 macOS 应用签名，不触发系统安全拦截（Gatekeeper / SIP）**，客户端更新后亦可无缝沿用。
+利用 Chrome DevTools Protocol (CDP) 在应用启动时进行纯内存级别的资源拦截与注入，**无需解包或修改任何安装文件，不破坏应用签名，不触发系统安全拦截（Gatekeeper / SmartScreen / SIP）**，客户端更新后亦可无缝沿用。
 
 ---
 
@@ -10,7 +10,8 @@
 
 ### 1. 纯内存热补丁，零改包、零破坏签名
 - **100% 用户空间与内存运作**：启动时直接解析 `app.asar` 头部偏移提取目标脚本，通过 CDP `Fetch` 协议在内存中替换前端核心代码。
-- **不篡改原应用包**：完全不动 `/Applications/ZCode.app` 任何二进制或 asar 文件，macOS 签名安全完好，随官方版本更新不失效。
+- **不篡改原应用包**：完全不动官方二进制或 asar 文件，应用签名安全完好，随官方版本更新不失效。
+- **跨平台原生适配**：全面兼容 **macOS** 与 **Windows**，自动探测安装路径、适配进程生命周期管理。
 
 ### 2. 免登录与虚拟用户就绪
 - **屏蔽全屏登录/欢迎弹窗**：切断启动时的强制账号检测守卫（`GJt`）与全屏遮罩组件渲染分支（`aKt`），无论离线还是未登录状态，绝不弹窗阻断。
@@ -36,8 +37,9 @@
 
 | 文件名 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `zcode-cdp-launcher.mjs` | Node.js 核心脚本 | 基于 CDP 的纯内存拦截器与启动注入守护进程 |
+| `zcode-cdp-launcher.mjs` | Node.js 跨平台脚本 | 基于 CDP 的纯内存拦截器与启动注入守护进程（macOS / Windows 通用） |
 | `启动ZCode(多模态解锁).command` | Shell 脚本 (macOS) | macOS 双击快捷运行脚本，自动识别环境并拉起守护进程 |
+| `启动ZCode(多模态解锁).bat` | 批处理脚本 (Windows) | Windows 双击快捷运行脚本，自动检测 Node 环境并拉起守护进程 |
 | `0001-Fix-version-downgrade-when-re-patching-an-updated-Cl.patch` | Git 补丁 | 解决 Claude Desktop 补丁升级时误还原旧备份导致版本回滚问题的修复补丁 |
 | `.gitignore` | 配置 | 忽略 `.DS_Store`、日志文件（`*.log`）等临时文件 |
 
@@ -45,30 +47,43 @@
 
 ## 🛠️ 环境要求
 
-- **操作系统**：macOS (Apple Silicon / Intel)
-- **目标应用**：ZCode.app 已安装在 `/Applications/ZCode.app`
-- **运行环境**：Node.js >= 22.0.0（支持 `mise`、`nvm`、`Homebrew` 安装的 Node）
+- **操作系统**：
+  - macOS (Apple Silicon / Intel)
+  - Windows 10 / 11 (x64 / arm64)
+- **目标应用**：ZCode 桌面客户端
+  - macOS 默认查找 `/Applications/ZCode.app`
+  - Windows 自动检测 `%LOCALAPPDATA%\Programs\ZCode` 或 `C:\Program Files\ZCode`
+  - *支持通过环境变量 `ZCODE_PATH` 指定自定义安装路径*
+- **运行环境**：Node.js >= 22.0.0
 
 ---
 
 ## 🚀 使用方法
 
-### 方式一：macOS 图标双击启动（推荐）
+### 方式一：macOS 用户双击启动
 
 1. 直接双击运行 `启动ZCode(多模态解锁).command`；
 2. 终端窗口将自动定位 Node.js 路径并启动守护进程；
 3. ZCode 启动完成后终端将在 2 秒后自动退出，后台守护进程随 ZCode 保持运行。
 
-> **提示**：如果双击提示没有权限，可在终端中执行一次：
+> **提示**：如果双击提示没有执行权限，在终端中执行一次：
 > ```bash
 > chmod +x "启动ZCode(多模态解锁).command" zcode-cdp-launcher.mjs
 > ```
 
 ---
 
-### 方式二：终端命令行启动
+### 方式二：Windows 用户双击启动
 
-通过 Node.js 直接执行启动器：
+1. 直接双击运行 `启动ZCode(多模态解锁).bat`；
+2. 脚本将自动检测系统中的 Node.js 环境，在后台无感知启动注入守护会话；
+3. 提示注入成功后窗口自动关闭，日志记录在同目录下的 `launcher.log`。
+
+---
+
+### 方式三：跨平台命令行启动
+
+任何系统下均可通过 Node.js 直接执行启动器：
 
 ```bash
 # 标准启动（如检测到未开启调试端口的 ZCode 将提示并平滑重启）
@@ -81,42 +96,44 @@ node zcode-cdp-launcher.mjs --restart
 node zcode-cdp-launcher.mjs --port=9333
 ```
 
-#### 命令行参数说明
+#### 命令行与环境变量说明
 
-| 参数 | 简写 | 默认值 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `--port=<port>` | - | `9333` | 指定 CDP 远程调试监听端口（默认避开 Chrome 的 9222） |
-| `--restart` | `-r` | `false` | 若已存在未开启调试端口的 ZCode 进程，自动安全重启 |
-| `--help` | `-h` | - | 打印帮助信息 |
+| 参数 / 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `--port=<port>` | `9333` | 指定 CDP 远程调试监听端口（默认避开 Chrome 的 9222） |
+| `--restart` / `-r` | `false` | 若已存在未开启调试端口的 ZCode 进程，自动安全重启 |
+| `--help` / `-h` | - | 打印帮助信息 |
+| 环境变量 `ZCODE_PATH` | 自动探测 | 指定 ZCode 可执行文件或安装目录的自定义路径 |
 
 ---
 
 ## 🔬 技术实现原理解析
 
 ```text
-+----------------------------------------------------------------+
-|                        启动脚本运行                             |
-|  (启动ZCode.command / node zcode-cdp-launcher.mjs)             |
-+-------------------------------+--------------------------------+
-                                |
-       [1] 更新用户配置          | 扫描 ~/.zcode 开启 supportsImage
-                                v
-       [2] 内存解析 asar         | 读取 /Applications/ZCode.app/Contents/...
-                                | /Resources/app.asar（只读、按需提取对应脚本）
-                                v
-       [3] 准备内存补丁          | 解除 /plan 附件阻断 + 解除视觉屏蔽
-                                | 屏蔽 aKt 登录遮罩 + 注入虚拟 local_user
-                                v
-       [4] 附加调试启动          | open -a ZCode.app --args --remote-debugging-port=9333
-                                v
-       [5] 建立 CDP WebSocket   | 监听 Fetch.requestPaused
-                                | 匹配 styles-*.js / catalogTree-*.js
-                                | -> Fetch.fulfillRequest (回传内存补丁)
-                                v
-       [6] 页面平滑生效          | Page.reload 重新加载，界面定制即刻就绪
-                                v
-       [7] 生命周期守护          | 保持常驻，监听窗口关闭 / 进程退出，随应用退出自动销毁
-+----------------------------------------------------------------+
++-------------------------------------------------------------------------+
+|                              启动脚本运行                                 |
+|  (启动ZCode.command / 启动ZCode.bat / node zcode-cdp-launcher.mjs)       |
++------------------------------------+------------------------------------+
+                                     |
+       [1] 更新用户配置               | 扫描 ~/.zcode 开启 supportsImage
+                                     v
+       [2] 内存解析 asar              | 跨平台定位并读取 app.asar 偏移头
+                                     | （只读、按需提取对应脚本，零写盘）
+                                     v
+       [3] 准备内存补丁               | 解除 /plan 附件阻断 + 解除视觉屏蔽
+                                     | 屏蔽 aKt 登录遮罩 + 注入虚拟 local_user
+                                     v
+       [4] 附加调试启动               | macOS: open -a ZCode.app --args ...
+                                     | Windows: spawn ZCode.exe --remote-debugging-port=9333
+                                     v
+       [5] 建立 CDP WebSocket        | 监听 Fetch.requestPaused
+                                     | 匹配 styles-*.js / catalogTree-*.js
+                                     | -> Fetch.fulfillRequest (回传内存补丁)
+                                     v
+       [6] 页面平滑生效               | Page.reload 重新加载，界面定制即刻就绪
+                                     v
+       [7] 跨平台生命周期守护         | 保持常驻，监听窗口关闭 / 进程退出，随应用退出自动销毁
++-------------------------------------------------------------------------+
 ```
 
 ---
